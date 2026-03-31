@@ -280,6 +280,7 @@ def extract_batch_features(aux, batch_y, feat_ids, args, refs, patch_nums):
     -------
     features : dict  {name: np.array [B * pred_len]}
     errors   : np.array [B * pred_len]
+    targets  : dict  {name: np.array [B * pred_len]}
     """
     pred = aux['pred'].detach().cpu().float()       # [B, pred_len, 1]
     h_layers = aux['h_layers']                      # list of [B, 1, d_ff, P]
@@ -343,6 +344,13 @@ def extract_batch_features(aux, batch_y, feat_ids, args, refs, patch_nums):
     p_diff[:, 0] = 0.0
     features['pred_delta'] = p_diff.ravel()
 
+    # ── directional accuracy (vs_prev_step) ──
+    true_np = true.squeeze(-1).detach().cpu().numpy()
+    pred_step = np.diff(pred_np, axis=-1, prepend=pred_np[:, :1])
+    true_step = np.diff(true_np, axis=-1, prepend=true_np[:, :1])
+    direction_correct = (np.sign(pred_step) == np.sign(true_step)).astype(np.int64)
+    targets = {'directional_correct': direction_correct.ravel()}
+
     # ── sample-level geometry (broadcast to pred_len) ──
     h_mean = h_np.mean(axis=-1)                       # [B, d_ff]
     r_mean = rp.mean(axis=1)                           # [B, d_llm]
@@ -391,7 +399,7 @@ def extract_batch_features(aux, batch_y, feat_ids, args, refs, patch_nums):
         features['llm_attn_max_weight'] = np.full(n, np.nan)
         features['llm_attn_entropy_head_var'] = np.full(n, np.nan)
 
-    return features, errors.ravel()
+    return features, errors.ravel(), targets
 
 
 def run_evaluation(model, args, device, refs):
@@ -404,6 +412,7 @@ def run_evaluation(model, args, device, refs):
 
     accum = {k: [] for k in FEATURE_NAMES}
     all_errors, all_ch = [], []
+    all_targets = {}
 
     idx = 0
     with torch.no_grad(), _autocast_ctx(device):
@@ -419,17 +428,22 @@ def run_evaluation(model, args, device, refs):
             di = torch.cat([by[:, :args.label_len, :], di], dim=1).float().to(device)
 
             aux = model(bx, bxm, di, bym_d, return_aux=True)
-            feats, errs = extract_batch_features(aux, by, fids, args, refs,
-                                                  patch_nums)
+            feats, errs, targets = extract_batch_features(
+                aux, by, fids, args, refs, patch_nums
+            )
 
             for k in FEATURE_NAMES:
                 accum[k].append(feats[k])
             all_errors.append(errs)
             all_ch.append(np.repeat(fids, args.pred_len))
+            for tk, tv in targets.items():
+                all_targets.setdefault(tk, []).append(tv)
 
     for k in FEATURE_NAMES:
         accum[k] = np.concatenate(accum[k])
-    return accum, np.concatenate(all_errors), np.concatenate(all_ch)
+    for tk in list(all_targets.keys()):
+        all_targets[tk] = np.concatenate(all_targets[tk])
+    return accum, np.concatenate(all_errors), np.concatenate(all_ch), all_targets
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +556,7 @@ def main():
     refs = collect_train_references(model, args, device)
 
     # ── Phase B ──
-    features, errors, channel_ids = run_evaluation(model, args, device, refs)
+    features, errors, channel_ids, targets = run_evaluation(model, args, device, refs)
 
     # ── Phase C ──
     metrics = compute_correlations(features, errors, channel_ids, args.enc_in)
@@ -551,7 +565,7 @@ def main():
 
     np.savez_compressed(
         os.path.join(args.output_dir, 'features.npz'),
-        errors=errors, channel_ids=channel_ids, **features,
+        errors=errors, channel_ids=channel_ids, **features, **targets,
     )
 
     # ── Phase D ──
