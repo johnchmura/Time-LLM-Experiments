@@ -11,12 +11,15 @@ y_hat_t is a linear function of ALL patch positions; the patch-to-horizon alignm
 """
 
 import argparse
+import hashlib
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from scipy import stats as scipy_stats
 from sklearn.neighbors import NearestNeighbors
@@ -111,8 +114,23 @@ def parse_args():
                    choices=['spread', 'last_patch'],
                    help='Patch-to-horizon mapping strategy')
     p.add_argument('--split', type=str, default='test', choices=['val', 'test'])
+    p.add_argument('--splits', type=str, default='',
+                   help='Comma-separated eval splits (overrides --split), e.g. "val,test"')
     p.add_argument('--num_workers', type=int, default=4)
     p.add_argument('--device', type=str, default='auto')
+    p.add_argument('--output_basename', type=str, default='features',
+                   help='Per-split NPZ prefix: {output_basename}_{split}.npz')
+    p.add_argument('--no_plots', action='store_true',
+                   help='Skip feature-vs-error plots (faster extraction-only runs)')
+    p.add_argument('--with_checkpoint_hash', action='store_true',
+                   help='Compute SHA256 of checkpoint for provenance (can be slow for large files)')
+    p.add_argument(
+        '--strict_gap_steps',
+        type=int,
+        default=0,
+        help='If >0, for val/test keep only rows with dataset_row_index >= strict_gap_steps '
+             '(use seq_len for strict no-overlap boundary protocol).',
+    )
 
     return p.parse_args()
 
@@ -149,6 +167,102 @@ def build_dataset(args, flag):
         timeenc=timeenc, freq=args.freq,
         percent=args.percent, seasonal_patterns=args.seasonal_patterns,
     )
+
+
+def parse_eval_splits(args):
+    if args.splits.strip():
+        raw = [x.strip() for x in args.splits.split(',') if x.strip()]
+    else:
+        raw = [args.split]
+    allowed = {'val', 'test', 'train'}
+    bad = [s for s in raw if s not in allowed]
+    if bad:
+        raise ValueError(f"Unsupported split(s): {bad}. Allowed: {sorted(allowed)}")
+    # Preserve order while deduplicating.
+    out = []
+    seen = set()
+    for s in raw:
+        if s not in seen:
+            out.append(s)
+            seen.add(s)
+    return out
+
+
+def maybe_sha256(path, enabled):
+    if not enabled:
+        return None
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        while True:
+            buf = f.read(1024 * 1024)
+            if not buf:
+                break
+            h.update(buf)
+    return h.hexdigest()
+
+
+def git_commit_hash():
+    try:
+        out = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def _split_date_index(args, split_flag, ds):
+    """
+    Return datetime index for this split's `data_x` rows if reconstructable.
+    For datasets without a direct `date` column, returns None.
+    """
+    csv_path = os.path.join(args.root_path, args.data_path)
+    if not os.path.exists(csv_path):
+        return None
+    try:
+        df = pd.read_csv(csv_path, parse_dates=['date'])
+    except Exception:
+        return None
+    if 'date' not in df.columns:
+        return None
+
+    cls = ds.__class__.__name__
+    type_map = {'train': 0, 'val': 1, 'test': 2}
+    if split_flag not in type_map:
+        return None
+    st = type_map[split_flag]
+
+    if cls == 'Dataset_ETT_hour':
+        b1s = [0, 12 * 30 * 24 - args.seq_len, 12 * 30 * 24 + 4 * 30 * 24 - args.seq_len]
+        b2s = [12 * 30 * 24, 12 * 30 * 24 + 4 * 30 * 24, 12 * 30 * 24 + 8 * 30 * 24]
+        b1, b2 = b1s[st], b2s[st]
+        if st == 0:
+            b2 = (b2 - args.seq_len) * args.percent // 100 + args.seq_len
+    elif cls == 'Dataset_ETT_minute':
+        b1s = [0, 12 * 30 * 24 * 4 - args.seq_len, 12 * 30 * 24 * 4 + 4 * 30 * 24 * 4 - args.seq_len]
+        b2s = [12 * 30 * 24 * 4, 12 * 30 * 24 * 4 + 4 * 30 * 24 * 4, 12 * 30 * 24 * 4 + 8 * 30 * 24 * 4]
+        b1, b2 = b1s[st], b2s[st]
+        if st == 0:
+            b2 = (b2 - args.seq_len) * args.percent // 100 + args.seq_len
+    elif cls == 'Dataset_Custom':
+        n = len(df)
+        n_train = int(n * 0.7)
+        n_test = int(n * 0.2)
+        n_val = n - n_train - n_test
+        b1s = [0, n_train - args.seq_len, n - n_test - args.seq_len]
+        b2s = [n_train, n_train + n_val, n]
+        b1, b2 = b1s[st], b2s[st]
+        if st == 0:
+            b2 = (b2 - args.seq_len) * args.percent // 100 + args.seq_len
+    else:
+        return None
+
+    dates = pd.to_datetime(df['date'].iloc[b1:b2], errors='coerce').to_numpy()
+    if dates.shape[0] == 0:
+        return None
+    return dates
 
 
 def load_model(args, device):
@@ -272,7 +386,7 @@ def collect_train_references(model, args, device):
 # Phase B: evaluation feature extraction
 # ---------------------------------------------------------------------------
 
-def extract_batch_features(aux, batch_y, feat_ids, args, refs, patch_nums):
+def extract_batch_features(aux, batch_y, batch_ym, feat_ids, args, refs, patch_nums):
     """
     Compute all scalar features for one batch.
 
@@ -281,6 +395,8 @@ def extract_batch_features(aux, batch_y, feat_ids, args, refs, patch_nums):
     features : dict  {name: np.array [B * pred_len]}
     errors   : np.array [B * pred_len]
     targets  : dict  {name: np.array [B * pred_len]}
+    metadata : dict  {name: np.array [...]} flattened to [B * pred_len] except
+                      `time_features` with shape [B * pred_len, D_time]
     """
     pred = aux['pred'].detach().cpu().float()       # [B, pred_len, 1]
     h_layers = aux['h_layers']                      # list of [B, 1, d_ff, P]
@@ -350,6 +466,20 @@ def extract_batch_features(aux, batch_y, feat_ids, args, refs, patch_nums):
     true_step = np.diff(true_np, axis=-1, prepend=true_np[:, :1])
     direction_correct = (np.sign(pred_step) == np.sign(true_step)).astype(np.int64)
     targets = {'directional_correct': direction_correct.ravel()}
+    true_prev = np.concatenate([true_np[:, :1], true_np[:, :-1]], axis=1)
+    pred_prev = np.concatenate([pred_np[:, :1], pred_np[:, :-1]], axis=1)
+    metadata = {
+        'y_true': true_np.ravel(),
+        'y_pred': pred_np.ravel(),
+        'y_prev': true_prev.ravel(),
+        'pred_prev': pred_prev.ravel(),
+        'direction_true': np.sign(true_step).astype(np.int8).ravel(),
+        'direction_pred': np.sign(pred_step).astype(np.int8).ravel(),
+        'error_abs': errors.ravel(),
+    }
+    if isinstance(batch_ym, torch.Tensor):
+        tmark = batch_ym[:, -pred_len:, :].detach().cpu().float().numpy()
+        metadata['time_features'] = tmark.reshape(B * pred_len, -1)
 
     # ── sample-level geometry (broadcast to pred_len) ──
     h_mean = h_np.mean(axis=-1)                       # [B, d_ff]
@@ -399,26 +529,52 @@ def extract_batch_features(aux, batch_y, feat_ids, args, refs, patch_nums):
         features['llm_attn_max_weight'] = np.full(n, np.nan)
         features['llm_attn_entropy_head_var'] = np.full(n, np.nan)
 
-    return features, errors.ravel(), targets
+    return features, errors.ravel(), targets, metadata
 
 
-def run_evaluation(model, args, device, refs):
+def run_evaluation(model, args, device, refs, split_flag):
     """Iterate over the eval split, extract features and errors."""
-    ds = build_dataset(args, args.split)
+    ds = build_dataset(args, split_flag)
+    split_dates = _split_date_index(args, split_flag, ds)
     tot_len = ds.tot_len
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+    all_indices = np.arange(len(ds), dtype=np.int64)
+    if args.strict_gap_steps > 0 and split_flag in {'val', 'test'}:
+        row_idx = all_indices % tot_len
+        all_indices = all_indices[row_idx >= int(args.strict_gap_steps)]
+    if len(all_indices) == 0:
+        raise ValueError(
+            f"No samples remain for split={split_flag} after strict_gap_steps={args.strict_gap_steps}. "
+            f"tot_len={tot_len}"
+        )
+    subset = Subset(ds, all_indices.tolist())
+    loader = DataLoader(subset, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_workers, drop_last=False)
     patch_nums = model.patch_nums
 
     accum = {k: [] for k in FEATURE_NAMES}
     all_errors, all_ch = [], []
     all_targets = {}
+    all_meta = {
+        'sample_id': [],
+        'dataset_row_index': [],
+        'horizon_t': [],
+        'y_true': [],
+        'y_pred': [],
+        'y_prev': [],
+        'pred_prev': [],
+        'direction_true': [],
+        'direction_pred': [],
+        'time_features': [],
+    }
 
     idx = 0
+    ptr = 0
     with torch.no_grad(), _autocast_ctx(device):
         for bx, by, bxm, bym in tqdm(loader, desc='Eval'):
             B = bx.shape[0]
-            fids = np.array([(idx + j) // tot_len for j in range(B)])
+            batch_orig_idx = all_indices[ptr:ptr + B]
+            ptr += B
+            fids = (batch_orig_idx // tot_len).astype(np.int64)
             idx += B
 
             bx = bx.float().to(device)
@@ -428,22 +584,58 @@ def run_evaluation(model, args, device, refs):
             di = torch.cat([by[:, :args.label_len, :], di], dim=1).float().to(device)
 
             aux = model(bx, bxm, di, bym_d, return_aux=True)
-            feats, errs, targets = extract_batch_features(
-                aux, by, fids, args, refs, patch_nums
+            feats, errs, targets, meta = extract_batch_features(
+                aux, by, bym, fids, args, refs, patch_nums
             )
 
             for k in FEATURE_NAMES:
                 accum[k].append(feats[k])
             all_errors.append(errs)
-            all_ch.append(np.repeat(fids, args.pred_len))
+            ch_rep = np.repeat(fids, args.pred_len)
+            all_ch.append(ch_rep)
             for tk, tv in targets.items():
                 all_targets.setdefault(tk, []).append(tv)
+
+            # Provenance per flattened horizon row.
+            sample_ids = np.arange(idx - B, idx)
+            all_meta['sample_id'].append(np.repeat(sample_ids, args.pred_len))
+            all_meta['dataset_row_index'].append(np.repeat(batch_orig_idx % tot_len, args.pred_len))
+            all_meta['horizon_t'].append(np.tile(np.arange(args.pred_len), B))
+            all_meta['y_true'].append(meta['y_true'])
+            all_meta['y_pred'].append(meta['y_pred'])
+            all_meta['y_prev'].append(meta['y_prev'])
+            all_meta['pred_prev'].append(meta['pred_prev'])
+            all_meta['direction_true'].append(meta['direction_true'])
+            all_meta['direction_pred'].append(meta['direction_pred'])
+            if 'time_features' in meta:
+                all_meta['time_features'].append(meta['time_features'])
 
     for k in FEATURE_NAMES:
         accum[k] = np.concatenate(accum[k])
     for tk in list(all_targets.keys()):
         all_targets[tk] = np.concatenate(all_targets[tk])
-    return accum, np.concatenate(all_errors), np.concatenate(all_ch), all_targets
+    out_meta = {}
+    for mk, mv in all_meta.items():
+        if not mv:
+            continue
+        if mk == 'time_features':
+            out_meta[mk] = np.concatenate(mv, axis=0)
+        else:
+            out_meta[mk] = np.concatenate(mv)
+    if split_dates is not None and 'dataset_row_index' in out_meta and 'horizon_t' in out_meta:
+        # Map each flattened horizon row to target timestamp index in split-local data_x.
+        ts_idx = out_meta['dataset_row_index'].astype(np.int64) + args.seq_len + out_meta['horizon_t'].astype(np.int64)
+        ts_idx = np.clip(ts_idx, 0, len(split_dates) - 1)
+        out_meta['timestamp'] = split_dates[ts_idx].astype('datetime64[s]').astype(str)
+    return (
+        accum,
+        np.concatenate(all_errors),
+        np.concatenate(all_ch),
+        all_targets,
+        out_meta,
+        int(len(all_indices)),
+        int(len(ds)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -479,8 +671,8 @@ def compute_correlations(features, errors, channel_ids, enc_in):
 # Phase D: plots
 # ---------------------------------------------------------------------------
 
-def make_plots(features, errors, output_dir):
-    fig_dir = os.path.join(output_dir, 'figures')
+def make_plots(features, errors, output_dir, figure_subdir='figures'):
+    fig_dir = os.path.join(output_dir, figure_subdir)
     os.makedirs(fig_dir, exist_ok=True)
 
     for fname in FEATURE_NAMES:
@@ -538,6 +730,7 @@ def make_plots(features, errors, output_dir):
 
 def main():
     args = parse_args()
+    eval_splits = parse_eval_splits(args)
     device = get_device(args.device)
     print(f"Device: {device}")
 
@@ -545,7 +738,9 @@ def main():
     os.makedirs(os.path.join(args.output_dir, 'figures'), exist_ok=True)
 
     with open(os.path.join(args.output_dir, 'run_config.json'), 'w') as f:
-        json.dump(vars(args), f, indent=2)
+        cfg = dict(vars(args))
+        cfg['resolved_splits'] = eval_splits
+        json.dump(cfg, f, indent=2)
 
     # ── load model ──
     model = load_model(args, device)
@@ -555,34 +750,101 @@ def main():
     # ── Phase A ──
     refs = collect_train_references(model, args, device)
 
-    # ── Phase B ──
-    features, errors, channel_ids, targets = run_evaluation(model, args, device, refs)
+    # Save reference statistics for one-shot extraction provenance.
+    ref_out = {}
+    for fid, c in refs['centroids'].items():
+        ref_out[f'centroid_{fid}'] = c
+    for fid, c in refs['reprog_centroids'].items():
+        ref_out[f'reprog_centroid_{fid}'] = c
+    np.savez_compressed(os.path.join(args.output_dir, 'train_reference_stats.npz'), **ref_out)
 
-    # ── Phase C ──
-    metrics = compute_correlations(features, errors, channel_ids, args.enc_in)
-    with open(os.path.join(args.output_dir, 'metrics.json'), 'w') as f:
-        json.dump(metrics, f, indent=2)
+    provenance = {
+        'checkpoint_path': os.path.abspath(args.checkpoint),
+        'checkpoint_sha256': maybe_sha256(args.checkpoint, args.with_checkpoint_hash),
+        'git_commit': git_commit_hash(),
+        'feature_names': FEATURE_NAMES,
+        'resolved_splits': eval_splits,
+        'args': vars(args),
+    }
+    with open(os.path.join(args.output_dir, 'provenance.json'), 'w') as f:
+        json.dump(provenance, f, indent=2)
 
-    np.savez_compressed(
-        os.path.join(args.output_dir, 'features.npz'),
-        errors=errors, channel_ids=channel_ids, **features, **targets,
-    )
+    data_contract = {'splits': {}, 'feature_names': FEATURE_NAMES}
 
-    # ── Phase D ──
-    make_plots(features, errors, args.output_dir)
+    for split_flag in eval_splits:
+        print(f"\n=== Evaluating split: {split_flag} ===")
+        (
+            features,
+            errors,
+            channel_ids,
+            targets,
+            metadata,
+            n_used,
+            n_total,
+        ) = run_evaluation(
+            model, args, device, refs, split_flag
+        )
 
-    # ── summary ──
-    print("\n=== Correlation Summary (pooled) ===")
-    print(f"  {'feature':35s} {'Pearson r':>10s}  {'p':>10s}  "
-          f"{'Spearman r':>10s}  {'p':>10s}")
-    print("  " + "-" * 80)
-    for fname in FEATURE_NAMES:
-        m = metrics['pooled'].get(fname, {})
-        pr = m.get('pearson_r', float('nan'))
-        pp = m.get('pearson_p', float('nan'))
-        sr = m.get('spearman_r', float('nan'))
-        sp = m.get('spearman_p', float('nan'))
-        print(f"  {fname:35s} {pr:10.4f}  {pp:10.2e}  {sr:10.4f}  {sp:10.2e}")
+        metrics = compute_correlations(features, errors, channel_ids, args.enc_in)
+        with open(os.path.join(args.output_dir, f'metrics_{split_flag}.json'), 'w') as f:
+            json.dump(metrics, f, indent=2)
+
+        out_npz = os.path.join(args.output_dir, f'{args.output_basename}_{split_flag}.npz')
+        payload = dict(
+            errors=errors,
+            channel_ids=channel_ids,
+            sample_id=metadata.get('sample_id'),
+            dataset_row_index=metadata.get('dataset_row_index'),
+            horizon_t=metadata.get('horizon_t'),
+            y_true=metadata.get('y_true'),
+            y_pred=metadata.get('y_pred'),
+            y_prev=metadata.get('y_prev'),
+            pred_prev=metadata.get('pred_prev'),
+            direction_true=metadata.get('direction_true'),
+            direction_pred=metadata.get('direction_pred'),
+            **features,
+            **targets,
+        )
+        if 'timestamp' in metadata:
+            payload['timestamp'] = metadata['timestamp']
+        if 'time_features' in metadata:
+            payload['time_features'] = metadata['time_features']
+        np.savez_compressed(out_npz, **payload)
+
+        # Backward-compatible single-split output.
+        if len(eval_splits) == 1:
+            np.savez_compressed(
+                os.path.join(args.output_dir, 'features.npz'),
+                **payload,
+            )
+
+        if not args.no_plots:
+            make_plots(features, errors, args.output_dir, figure_subdir=f'figures_{split_flag}')
+
+        print("\n=== Correlation Summary (pooled) ===")
+        print(f"  {'feature':35s} {'Pearson r':>10s}  {'p':>10s}  "
+              f"{'Spearman r':>10s}  {'p':>10s}")
+        print("  " + "-" * 80)
+        for fname in FEATURE_NAMES:
+            m = metrics['pooled'].get(fname, {})
+            pr = m.get('pearson_r', float('nan'))
+            pp = m.get('pearson_p', float('nan'))
+            sr = m.get('spearman_r', float('nan'))
+            sp = m.get('spearman_p', float('nan'))
+            print(f"  {fname:35s} {pr:10.4f}  {pp:10.2e}  {sr:10.4f}  {sp:10.2e}")
+
+        split_contract = {}
+        for k, v in payload.items():
+            if v is None:
+                continue
+            arr = np.asarray(v)
+            split_contract[k] = {'shape': list(arr.shape), 'dtype': str(arr.dtype)}
+        split_contract['_rows_used'] = n_used
+        split_contract['_rows_total_before_gap_filter'] = n_total
+        data_contract['splits'][split_flag] = split_contract
+
+    with open(os.path.join(args.output_dir, 'data_contract.json'), 'w') as f:
+        json.dump(data_contract, f, indent=2)
 
     print(f"\nResults saved to {args.output_dir}")
 

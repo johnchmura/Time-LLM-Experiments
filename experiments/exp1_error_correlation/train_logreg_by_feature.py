@@ -24,7 +24,22 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_a
 from sklearn.model_selection import train_test_split
 
 
-SKIP_KEYS = {"errors", "channel_ids", "directional_correct"}
+SKIP_KEYS = {
+    "errors",
+    "channel_ids",
+    "directional_correct",
+    "sample_id",
+    "dataset_row_index",
+    "horizon_t",
+    "y_true",
+    "y_pred",
+    "y_prev",
+    "pred_prev",
+    "direction_true",
+    "direction_pred",
+    "timestamp",
+    "time_features",
+}
 
 
 def _finite_xy(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

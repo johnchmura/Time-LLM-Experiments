@@ -44,6 +44,22 @@ import xgboost as xgb
 TARGETS = ["high_error_median", "high_error_q75", "high_error_q90"]
 FEATURE_SET_ALL = "all_features"
 FEATURE_SET_L1 = "l1_selected"
+SKIP_KEYS = {
+    "errors",
+    "channel_ids",
+    "directional_correct",
+    "sample_id",
+    "dataset_row_index",
+    "horizon_t",
+    "y_true",
+    "y_pred",
+    "y_prev",
+    "pred_prev",
+    "direction_true",
+    "direction_pred",
+    "timestamp",
+    "time_features",
+}
 
 
 def _now_s() -> float:
@@ -132,6 +148,8 @@ class ResidualMLP(nn.Module):
 
 @dataclass(frozen=True)
 class Args:
+    train_npz_path: str
+    test_npz_path: str
     npz_path: str
     l1_summary_path: str
     out_dir: str
@@ -153,6 +171,18 @@ class Args:
 
 def parse_args() -> Args:
     p = argparse.ArgumentParser(description="Exp1: train MLP + XGBoost on feature NPZ")
+    p.add_argument(
+        "--train_npz_path",
+        type=str,
+        default="",
+        help="Optional NPZ for risk-model training (if set, must also set --test_npz_path).",
+    )
+    p.add_argument(
+        "--test_npz_path",
+        type=str,
+        default="",
+        help="Optional NPZ for held-out evaluation (if set, must also set --train_npz_path).",
+    )
     p.add_argument(
         "--npz_path",
         type=str,
@@ -200,6 +230,8 @@ def parse_args() -> Args:
 
     a = p.parse_args()
     return Args(
+        train_npz_path=a.train_npz_path,
+        test_npz_path=a.test_npz_path,
         npz_path=a.npz_path,
         l1_summary_path=a.l1_summary_path,
         out_dir=a.out_dir,
@@ -224,6 +256,21 @@ def _pick_device(requested: str) -> torch.device:
     if requested == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(requested)
+
+
+def _load_npz_xy(
+    npz_path: str, feature_keys: Optional[List[str]] = None
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    npz = np.load(npz_path, allow_pickle=False)
+    errors = npz["errors"].astype(np.float64)
+    if feature_keys is None:
+        feature_keys = sorted([k for k in npz.files if k not in SKIP_KEYS])
+    missing = [k for k in feature_keys if k not in npz.files]
+    if missing:
+        raise ValueError(f"Missing features in {npz_path}: {missing[:5]}")
+    x_all = np.stack([npz[k].astype(np.float32) for k in feature_keys], axis=1)
+    mask = _finite_rows_mask(x_all) & np.isfinite(errors)
+    return x_all[mask], errors[mask], feature_keys
 
 
 def _maybe_eval_subset(
@@ -486,34 +533,47 @@ def main() -> None:
     _ensure_dir(args.out_dir)
     device = _pick_device(args.device)
 
-    npz = np.load(args.npz_path, allow_pickle=False)
-    errors = npz["errors"].astype(np.float64)
-
-    feature_keys = [k for k in npz.files if k not in ("errors", "channel_ids", "directional_correct")]
-    feature_keys = sorted(feature_keys)
-    x_all = np.stack([npz[k].astype(np.float32) for k in feature_keys], axis=1)
-
-    mask = _finite_rows_mask(x_all) & np.isfinite(errors)
-    x_all = x_all[mask]
-    errors = errors[mask]
-
-    thresholds = _compute_thresholds(errors)
-    y_by_target = {
-        "high_error_median": (errors > thresholds["median"]).astype(np.int64),
-        "high_error_q75": (errors > thresholds["q75"]).astype(np.int64),
-        "high_error_q90": (errors > thresholds["q90"]).astype(np.int64),
-    }
+    using_explicit_split = bool(args.train_npz_path) or bool(args.test_npz_path)
+    if using_explicit_split:
+        if not args.train_npz_path or not args.test_npz_path:
+            raise ValueError("When using explicit NPZ split mode, set both --train_npz_path and --test_npz_path.")
+        x_train_all, errors_train, feature_keys = _load_npz_xy(args.train_npz_path, feature_keys=None)
+        x_test_all, errors_test, _ = _load_npz_xy(args.test_npz_path, feature_keys=feature_keys)
+        thresholds = _compute_thresholds(errors_train)
+        y_by_target_train = {
+            "high_error_median": (errors_train > thresholds["median"]).astype(np.int64),
+            "high_error_q75": (errors_train > thresholds["q75"]).astype(np.int64),
+            "high_error_q90": (errors_train > thresholds["q90"]).astype(np.int64),
+        }
+        y_by_target_test = {
+            "high_error_median": (errors_test > thresholds["median"]).astype(np.int64),
+            "high_error_q75": (errors_test > thresholds["q75"]).astype(np.int64),
+            "high_error_q90": (errors_test > thresholds["q90"]).astype(np.int64),
+        }
+        n_rows_all = int(len(x_train_all) + len(x_test_all))
+    else:
+        x_all, errors, feature_keys = _load_npz_xy(args.npz_path, feature_keys=None)
+        thresholds = _compute_thresholds(errors)
+        y_by_target = {
+            "high_error_median": (errors > thresholds["median"]).astype(np.int64),
+            "high_error_q75": (errors > thresholds["q75"]).astype(np.int64),
+            "high_error_q90": (errors > thresholds["q90"]).astype(np.int64),
+        }
+        n_rows_all = int(len(x_all))
 
     l1_sel = _load_l1_selected(args.l1_summary_path)
 
     summary: Dict[str, Any] = {
         "npz_path": args.npz_path,
+        "train_npz_path": args.train_npz_path,
+        "test_npz_path": args.test_npz_path,
+        "explicit_split_mode": using_explicit_split,
         "l1_summary_path": args.l1_summary_path,
         "out_dir": args.out_dir,
         "seed": args.seed,
         "test_size": args.test_size,
         "thresholds": thresholds,
-        "n_rows": int(len(x_all)),
+        "n_rows": n_rows_all,
         "feature_keys_all": feature_keys,
         "feature_sets": [FEATURE_SET_ALL, FEATURE_SET_L1],
         "targets": {},
@@ -523,18 +583,24 @@ def main() -> None:
     target_loop = tqdm(TARGETS, desc="Targets (XGB+MLP per feature set)", unit="target") if show_tqdm else TARGETS
 
     for tname in target_loop:
-        y = y_by_target[tname]
-        x_tr_idx, x_te_idx = train_test_split(
-            np.arange(len(y)),
-            test_size=args.test_size,
-            random_state=args.seed,
-            stratify=y,
-        )
-
-        x_tr_all = x_all[x_tr_idx]
-        x_te_all = x_all[x_te_idx]
-        y_tr = y[x_tr_idx]
-        y_te = y[x_te_idx]
+        if using_explicit_split:
+            x_tr_all = x_train_all
+            x_te_all = x_test_all
+            y_tr = y_by_target_train[tname]
+            y_te = y_by_target_test[tname]
+            y = np.concatenate([y_tr, y_te])
+        else:
+            y = y_by_target[tname]
+            x_tr_idx, x_te_idx = train_test_split(
+                np.arange(len(y)),
+                test_size=args.test_size,
+                random_state=args.seed,
+                stratify=y,
+            )
+            x_tr_all = x_all[x_tr_idx]
+            x_te_all = x_all[x_te_idx]
+            y_tr = y[x_tr_idx]
+            y_te = y[x_te_idx]
 
         sel_names = l1_sel.get(tname, [])
         sel_names = [n for n in sel_names if n in feature_keys]

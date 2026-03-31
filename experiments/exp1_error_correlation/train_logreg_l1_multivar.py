@@ -32,7 +32,22 @@ from sklearn.preprocessing import StandardScaler
 
 
 TARGETS = ["high_error_median", "high_error_q75", "high_error_q90"]
-SKIP_KEYS = {"errors", "channel_ids", "directional_correct"}
+SKIP_KEYS = {
+    "errors",
+    "channel_ids",
+    "directional_correct",
+    "sample_id",
+    "dataset_row_index",
+    "horizon_t",
+    "y_true",
+    "y_pred",
+    "y_prev",
+    "pred_prev",
+    "direction_true",
+    "direction_pred",
+    "timestamp",
+    "time_features",
+}
 
 
 def _load_thresholds_from_summary(summary_path: str) -> Optional[Dict[str, float]]:

@@ -247,7 +247,7 @@ class Model(nn.Module):
         source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
 
         x_enc = x_enc.permute(0, 2, 1).contiguous()
-        enc_out, n_vars = self.patch_embedding(x_enc.to(torch.float16))
+        enc_out, n_vars = self.patch_embedding(x_enc.to(torch.bfloat16))
 
         if return_aux:
             enc_out, reprog_attn = self.reprogramming_layer(
