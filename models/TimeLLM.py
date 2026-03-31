@@ -40,52 +40,54 @@ class Model(nn.Module):
         self.patch_len = configs.patch_len
         self.stride = configs.stride
 
+        _eager = getattr(configs, 'use_eager_attention', False)
+
         if configs.llm_model == 'LLAMA':
             # self.llama_config = LlamaConfig.from_pretrained('/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/')
             self.llama_config = LlamaConfig.from_pretrained('huggyllama/llama-7b')
             self.llama_config.num_hidden_layers = configs.llm_layers
-            self.llama_config.output_attentions = True
-            self.llama_config.output_hidden_states = True
+            self.llama_config.output_attentions = False
+            self.llama_config.output_hidden_states = False
+            if _eager:
+                self.llama_config._attn_implementation = 'eager'
+            _llama_hf_id = 'huggyllama/llama-7b'
+            _local_load_errors = (OSError, EnvironmentError, AttributeError, ValueError)
             try:
                 self.llm_model = LlamaModel.from_pretrained(
-                    # "/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/",
-                    'huggyllama/llama-7b',
+                    _llama_hf_id,
                     trust_remote_code=True,
                     local_files_only=True,
                     config=self.llama_config,
-                    # load_in_4bit=True
                 )
-            except EnvironmentError:  # downloads model from HF is not already done
-                print("Local model files not found. Attempting to download...")
+            except _local_load_errors as e:
+                print(f"Local Llama load failed ({type(e).__name__}: {e}). Fetching from Hugging Face...")
                 self.llm_model = LlamaModel.from_pretrained(
-                    # "/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/",
-                    'huggyllama/llama-7b',
+                    _llama_hf_id,
                     trust_remote_code=True,
                     local_files_only=False,
                     config=self.llama_config,
-                    # load_in_4bit=True
                 )
             try:
                 self.tokenizer = LlamaTokenizer.from_pretrained(
-                    # "/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/tokenizer.model",
-                    'huggyllama/llama-7b',
+                    _llama_hf_id,
                     trust_remote_code=True,
-                    local_files_only=True
+                    local_files_only=True,
                 )
-            except EnvironmentError:  # downloads the tokenizer from HF if not already done
-                print("Local tokenizer files not found. Atempting to download them..")
+            except _local_load_errors as e:
+                print(f"Local tokenizer load failed ({type(e).__name__}: {e}). Fetching from Hugging Face...")
                 self.tokenizer = LlamaTokenizer.from_pretrained(
-                    # "/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/tokenizer.model",
-                    'huggyllama/llama-7b',
+                    _llama_hf_id,
                     trust_remote_code=True,
-                    local_files_only=False
+                    local_files_only=False,
                 )
         elif configs.llm_model == 'GPT2':
             self.gpt2_config = GPT2Config.from_pretrained('openai-community/gpt2')
 
             self.gpt2_config.num_hidden_layers = configs.llm_layers
-            self.gpt2_config.output_attentions = True
-            self.gpt2_config.output_hidden_states = True
+            self.gpt2_config.output_attentions = False
+            self.gpt2_config.output_hidden_states = False
+            if _eager:
+                self.gpt2_config._attn_implementation = 'eager'
             try:
                 self.llm_model = GPT2Model.from_pretrained(
                     'openai-community/gpt2',
@@ -119,8 +121,10 @@ class Model(nn.Module):
             self.bert_config = BertConfig.from_pretrained('google-bert/bert-base-uncased')
 
             self.bert_config.num_hidden_layers = configs.llm_layers
-            self.bert_config.output_attentions = True
-            self.bert_config.output_hidden_states = True
+            self.bert_config.output_attentions = False
+            self.bert_config.output_hidden_states = False
+            if _eager:
+                self.bert_config._attn_implementation = 'eager'
             try:
                 self.llm_model = BertModel.from_pretrained(
                     'google-bert/bert-base-uncased',
@@ -175,7 +179,7 @@ class Model(nn.Module):
 
         self.word_embeddings = self.llm_model.get_input_embeddings().weight
         self.vocab_size = self.word_embeddings.shape[0]
-        self.num_tokens = 1000
+        self.num_tokens = getattr(configs, 'num_tokens', 1000)
         self.mapping_layer = nn.Linear(self.vocab_size, self.num_tokens)
 
         self.reprogramming_layer = ReprogrammingLayer(configs.d_model, configs.n_heads, self.d_ff, self.d_llm)
@@ -191,13 +195,19 @@ class Model(nn.Module):
 
         self.normalize_layers = Normalize(configs.enc_in, affine=False)
 
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None,
+                return_aux=False):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
-            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
-            return dec_out[:, -self.pred_len:, :]
+            result = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec,
+                                   return_aux=return_aux)
+            if return_aux:
+                aux = result
+                aux['pred'] = aux['pred'][:, -self.pred_len:, :]
+                return aux
+            return result[:, -self.pred_len:, :]
         return None
 
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_aux=False):
 
         x_enc = self.normalize_layers(x_enc, 'norm')
 
@@ -237,22 +247,86 @@ class Model(nn.Module):
         source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
 
         x_enc = x_enc.permute(0, 2, 1).contiguous()
-        enc_out, n_vars = self.patch_embedding(x_enc.to(torch.bfloat16))
-        enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
+        enc_out, n_vars = self.patch_embedding(x_enc.to(torch.float16))
+
+        if return_aux:
+            enc_out, reprog_attn = self.reprogramming_layer(
+                enc_out, source_embeddings, source_embeddings,
+                return_attention=True)
+        else:
+            enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
+
+        reprog_out = enc_out  # [B*N, patch_nums, d_llm]
+
         llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
-        dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
+        prompt_len = prompt_embeddings.shape[1]
+
+        if return_aux:
+            prev_hs = self.llm_model.config.output_hidden_states
+            self.llm_model.config.output_hidden_states = True
+            _has_attns = False
+            try:
+                prev_att = self.llm_model.config.output_attentions
+                self.llm_model.config.output_attentions = True
+                _has_attns = True
+            except (ValueError, AttributeError):
+                pass
+
+        llm_out = self.llm_model(inputs_embeds=llama_enc_out)
+
+        if return_aux:
+            self.llm_model.config.output_hidden_states = prev_hs
+            if _has_attns:
+                self.llm_model.config.output_attentions = prev_att
+
+        dec_out = llm_out.last_hidden_state
         dec_out = dec_out[:, :, :self.d_ff]
 
         dec_out = torch.reshape(
             dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
         dec_out = dec_out.permute(0, 1, 3, 2).contiguous()
 
-        dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:])
+        pre_head = dec_out[:, :, :, -self.patch_nums:]  # [B, n_vars, d_ff, patch_nums]
+
+        dec_out = self.output_projection(pre_head)
         dec_out = dec_out.permute(0, 2, 1).contiguous()
 
         dec_out = self.normalize_layers(dec_out, 'denorm')
 
-        return dec_out
+        if not return_aux:
+            return dec_out
+
+        # --- build auxiliary dict ---
+        # hidden_states: tuple of (n_layers+1) tensors [B*N, seq_total, d_llm]
+        # reshape each to [B, n_vars, seq_total, d_llm], slice to patch span,
+        # and truncate feature dim to d_ff for alignment with the head.
+        h_layers = []
+        for h in llm_out.hidden_states:
+            hl = h[:, :, :self.d_ff]                          # [B*N, seq_total, d_ff]
+            hl = hl.reshape(-1, n_vars, hl.shape[1], hl.shape[2])
+            hl = hl.permute(0, 1, 3, 2)                      # [B, n_vars, d_ff, seq_total]
+            hl = hl[:, :, :, -self.patch_nums:]               # [B, n_vars, d_ff, patch_nums]
+            h_layers.append(hl.detach().cpu())
+
+        llm_attns = []
+        if llm_out.attentions is not None:
+            for attn in llm_out.attentions:
+                llm_attns.append(attn.detach().cpu())
+
+        reprog_out_shaped = reprog_out.reshape(
+            -1, n_vars, reprog_out.shape[1], reprog_out.shape[2])  # [B, n_vars, patch_nums, d_llm]
+
+        return {
+            'pred': dec_out,
+            'h_layers': h_layers,
+            'h_last': h_layers[-1],
+            'pre_head': pre_head.detach().cpu(),        # [B, n_vars, d_ff, patch_nums]
+            'reprog_out': reprog_out_shaped.detach().cpu(),
+            'reprog_attn': reprog_attn.detach().cpu(),  # [B*N, n_heads, patch_nums, S]
+            'llm_attns': llm_attns,
+            'prompt_len': prompt_len,
+            'n_vars': n_vars,
+        }
 
     def calcute_lags(self, x_enc):
         q_fft = torch.fft.rfft(x_enc.permute(0, 2, 1).contiguous(), dim=-1)
@@ -277,7 +351,8 @@ class ReprogrammingLayer(nn.Module):
         self.n_heads = n_heads
         self.dropout = nn.Dropout(attention_dropout)
 
-    def forward(self, target_embedding, source_embedding, value_embedding):
+    def forward(self, target_embedding, source_embedding, value_embedding,
+                return_attention=False):
         B, L, _ = target_embedding.shape
         S, _ = source_embedding.shape
         H = self.n_heads
@@ -286,11 +361,14 @@ class ReprogrammingLayer(nn.Module):
         source_embedding = self.key_projection(source_embedding).view(S, H, -1)
         value_embedding = self.value_projection(value_embedding).view(S, H, -1)
 
-        out = self.reprogramming(target_embedding, source_embedding, value_embedding)
+        out, A = self.reprogramming(target_embedding, source_embedding, value_embedding)
 
         out = out.reshape(B, L, -1)
+        out = self.out_projection(out)
 
-        return self.out_projection(out)
+        if return_attention:
+            return out, A
+        return out
 
     def reprogramming(self, target_embedding, source_embedding, value_embedding):
         B, L, H, E = target_embedding.shape
@@ -302,4 +380,4 @@ class ReprogrammingLayer(nn.Module):
         A = self.dropout(torch.softmax(scale * scores, dim=-1))
         reprogramming_embedding = torch.einsum("bhls,she->blhe", A, value_embedding)
 
-        return reprogramming_embedding
+        return reprogramming_embedding, A

@@ -9,6 +9,7 @@ data_dict = {
     'ECL': Dataset_Custom,
     'Traffic': Dataset_Custom,
     'Weather': Dataset_Custom,
+    'Illness': Dataset_Custom,
     'm4': Dataset_M4,
 }
 
@@ -18,16 +19,17 @@ def data_provider(args, flag):
     timeenc = 0 if args.embed != 'timeF' else 1
     percent = args.percent
 
-    if flag == 'test':
-        shuffle_flag = False
-        drop_last = True
-        batch_size = args.batch_size
-        freq = args.freq
-    else:
+    if flag == 'train':
         shuffle_flag = True
-        drop_last = True
         batch_size = args.batch_size
-        freq = args.freq
+    elif flag in ('val', 'test'):
+        shuffle_flag = False
+        batch_size = args.eval_batch_size
+    else:
+        raise ValueError(f'Unknown data_provider flag: {flag}')
+
+    drop_last = True
+    freq = args.freq
 
     if args.data == 'm4':
         drop_last = False

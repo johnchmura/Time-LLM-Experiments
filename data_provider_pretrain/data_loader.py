@@ -1,4 +1,6 @@
 import os
+
+import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler
@@ -78,18 +80,19 @@ class Dataset_ETT_hour(Dataset):
         df_stamp = df_raw[['date']][border1:border2]
         df_stamp['date'] = pd.to_datetime(df_stamp.date)
         if self.timeenc == 0:
-            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
-            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
-            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
-            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
-            data_stamp = df_stamp.drop(['date'], 1).values
+            dt = df_stamp['date']
+            df_stamp['month'] = dt.dt.month
+            df_stamp['day'] = dt.dt.day
+            df_stamp['weekday'] = dt.dt.dayofweek
+            df_stamp['hour'] = dt.dt.hour
+            data_stamp = df_stamp.drop(columns=['date']).values
         elif self.timeenc == 1:
             data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
             data_stamp = data_stamp.transpose(1, 0)
 
         self.data_x = data[border1:border2]
         self.data_y = data[border1:border2]
-        self.data_stamp = data_stamp
+        self.data_stamp = np.asarray(data_stamp, dtype=np.float64)
 
     def __getitem__(self, index):
         feat_id = index // self.tot_len
@@ -185,20 +188,20 @@ class Dataset_ETT_minute(Dataset):
         df_stamp = df_raw[['date']][border1:border2]
         df_stamp['date'] = pd.to_datetime(df_stamp.date)
         if self.timeenc == 0:
-            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
-            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
-            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
-            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
-            df_stamp['minute'] = df_stamp.date.apply(lambda row: row.minute, 1)
-            df_stamp['minute'] = df_stamp.minute.map(lambda x: x // 15)
-            data_stamp = df_stamp.drop(['date'], 1).values
+            dt = df_stamp['date']
+            df_stamp['month'] = dt.dt.month
+            df_stamp['day'] = dt.dt.day
+            df_stamp['weekday'] = dt.dt.dayofweek
+            df_stamp['hour'] = dt.dt.hour
+            df_stamp['minute'] = dt.dt.minute // 15
+            data_stamp = df_stamp.drop(columns=['date']).values
         elif self.timeenc == 1:
             data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
             data_stamp = data_stamp.transpose(1, 0)
 
         self.data_x = data[border1:border2]
         self.data_y = data[border1:border2]
-        self.data_stamp = data_stamp
+        self.data_stamp = np.asarray(data_stamp, dtype=np.float64)
 
     def __getitem__(self, index):
         feat_id = index // self.tot_len

@@ -15,16 +15,17 @@ def data_provider(args, data, data_path, pretrain=True, flag='train'):
     timeenc = 0 if args.embed != 'timeF' else 1
     percent = args.percent
 
-    if flag == 'test':
-        shuffle_flag = False
-        drop_last = True
-        batch_size = args.batch_size
-        freq = args.freq
-    else:
+    if flag == 'train':
         shuffle_flag = True
-        drop_last = True
         batch_size = args.batch_size
-        freq = args.freq
+    elif flag in ('val', 'test'):
+        shuffle_flag = False
+        batch_size = args.eval_batch_size
+    else:
+        raise ValueError(f'Unknown data_provider flag: {flag}')
+
+    drop_last = True
+    freq = args.freq
 
     data_set = Data(
         root_path=args.root_path,

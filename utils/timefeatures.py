@@ -130,5 +130,14 @@ def time_features_from_frequency_str(freq_str: str) -> List[TimeFeature]:
     raise RuntimeError(supported_freq_msg)
 
 
+def _time_feature_row(feat: TimeFeature, dates) -> np.ndarray:
+    out = feat(dates)
+    if hasattr(out, "to_numpy"):
+        out = out.to_numpy(dtype=np.float64, copy=False)
+    return np.asarray(out, dtype=np.float64)
+
+
 def time_features(dates, freq='h'):
-    return np.vstack([feat(dates) for feat in time_features_from_frequency_str(freq)])
+    return np.vstack(
+        [_time_feature_row(feat, dates) for feat in time_features_from_frequency_str(freq)]
+    )

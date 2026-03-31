@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+checkpoints/
+experiments/results/
+
+dataset/ETT-small/
+dataset/electricity/
+dataset/illness/
+dataset/m4/
+dataset/traffic/
+dataset/weather/
+sync_from_server.sh
+sync_to_server.sh

@@ -1,0 +1,1 @@
+The national illness dataset contains weekly multivariate records of influenza-like indicators, including weighted and unweighted ILI rates, age-group counts, provider counts, and related statistics.

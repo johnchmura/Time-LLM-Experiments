@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import shutil
 
@@ -134,9 +135,10 @@ def del_files(dir_path):
     shutil.rmtree(dir_path)
 
 
-def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric):
-    total_loss = []
-    total_mae_loss = []
+def vali(args, accelerator, model, vali_data, vali_loader, _criterion, _mae_metric):
+    mse_sum_total = torch.zeros(1, device=accelerator.device, dtype=torch.float64)
+    mae_sum_total = torch.zeros(1, device=accelerator.device, dtype=torch.float64)
+    n_total = torch.zeros(1, device=accelerator.device, dtype=torch.float64)
     model.eval()
     with torch.no_grad():
         for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(vali_loader)):
@@ -163,24 +165,27 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
                 else:
                     outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-            outputs, batch_y = accelerator.gather_for_metrics((outputs, batch_y))
-
             f_dim = -1 if args.features == 'MS' else 0
             outputs = outputs[:, -args.pred_len:, f_dim:]
-            batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
+            batch_y = batch_y[:, -args.pred_len:, f_dim:].float().to(accelerator.device)
 
             pred = outputs.detach()
             true = batch_y.detach()
 
-            loss = criterion(pred, true)
+            mse_sum_batch = F.mse_loss(pred.float(), true.float(), reduction='sum')
+            mae_sum_batch = F.l1_loss(pred.float(), true.float(), reduction='sum')
+            mse_sum_total += mse_sum_batch.to(torch.float64)
+            mae_sum_total += mae_sum_batch.to(torch.float64)
+            n_total += pred.numel()
 
-            mae_loss = mae_metric(pred, true)
+    accelerator.wait_for_everyone()
+    mse_sum_total = accelerator.reduce(mse_sum_total, reduction='sum')
+    mae_sum_total = accelerator.reduce(mae_sum_total, reduction='sum')
+    n_total = accelerator.reduce(n_total, reduction='sum')
 
-            total_loss.append(loss.item())
-            total_mae_loss.append(mae_loss.item())
-
-    total_loss = np.average(total_loss)
-    total_mae_loss = np.average(total_mae_loss)
+    n = max(n_total.item(), 1.0)
+    total_loss = (mse_sum_total / n).item()
+    total_mae_loss = (mae_sum_total / n).item()
 
     model.train()
     return total_loss, total_mae_loss

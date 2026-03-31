@@ -6,6 +6,7 @@ llama_layers=32
 master_port=00098
 num_process=8
 batch_size=24
+eval_batch_size=4
 d_model=32
 d_ff=128
 
@@ -33,6 +34,8 @@ accelerate launch --multi_gpu --mixed_precision bf16 --num_processes $num_proces
   --d_model $d_model \
   --d_ff $d_ff \
   --batch_size $batch_size \
+  --eval_batch_size $eval_batch_size \
+  --use_amp \
   --learning_rate $learning_rate \
   --llm_layers $llama_layers \
   --train_epochs $train_epochs \
@@ -59,6 +62,8 @@ accelerate launch --multi_gpu --mixed_precision bf16 --num_processes $num_proces
   --d_model $d_model \
   --d_ff $d_ff \
   --batch_size $batch_size \
+  --eval_batch_size $eval_batch_size \
+  --use_amp \
   --lradj 'TST'\
   --learning_rate 0.002 \
   --llm_layers $llama_layers \
@@ -86,6 +91,8 @@ accelerate launch --multi_gpu --mixed_precision bf16 --num_processes $num_proces
   --d_model $d_model \
   --d_ff $d_ff \
   --batch_size $batch_size \
+  --eval_batch_size $eval_batch_size \
+  --use_amp \
   --lradj 'TST'\
   --learning_rate 0.005 \
   --llm_layers $llama_layers \
@@ -114,6 +121,8 @@ accelerate launch --multi_gpu --mixed_precision bf16 --num_processes $num_proces
   --d_model 16 \
   --d_ff 128 \
   --batch_size $batch_size \
+  --eval_batch_size $eval_batch_size \
+  --use_amp \
   --learning_rate 0.005 \
   --lradj 'TST'\
   --llm_layers $llama_layers \

@@ -3,6 +3,7 @@ model_name=TimeLLM
 train_epochs=50
 llama_layers=32
 batch_size=24
+eval_batch_size=4
 learning_rate=0.001
 d_model=8
 d_ff=32
@@ -30,6 +31,8 @@ accelerate launch --multi_gpu --mixed_precision bf16 --num_processes $num_proces
   --patch_len 1 \
   --stride 1 \
   --batch_size $batch_size \
+  --eval_batch_size $eval_batch_size \
+  --use_amp \
   --des 'Exp' \
   --itr 1 \
   --learning_rate $learning_rate \
@@ -55,6 +58,8 @@ accelerate launch --multi_gpu --mixed_precision bf16 --num_processes $num_proces
   --patch_len 1 \
   --stride 1 \
   --batch_size $batch_size \
+  --eval_batch_size $eval_batch_size \
+  --use_amp \
   --des 'Exp' \
   --itr 1 \
   --learning_rate $learning_rate \
@@ -80,6 +85,8 @@ accelerate launch --multi_gpu --mixed_precision bf16 --num_processes $num_proces
   --patch_len 1 \
   --stride 1 \
   --batch_size $batch_size \
+  --eval_batch_size $eval_batch_size \
+  --use_amp \
   --des 'Exp' \
   --itr 1 \
   --learning_rate $learning_rate \
@@ -105,6 +112,8 @@ accelerate launch --multi_gpu --mixed_precision bf16 --num_processes $num_proces
   --patch_len 1 \
   --stride 1 \
   --batch_size $batch_size \
+  --eval_batch_size $eval_batch_size \
+  --use_amp \
   --des 'Exp' \
   --itr 1 \
   --learning_rate $learning_rate \
@@ -130,6 +139,8 @@ accelerate launch --multi_gpu --mixed_precision bf16 --num_processes $num_proces
   --patch_len 1 \
   --stride 1 \
   --batch_size $batch_size \
+  --eval_batch_size $eval_batch_size \
+  --use_amp \
   --des 'Exp' \
   --itr 1 \
   --learning_rate $learning_rate \
@@ -156,6 +167,8 @@ accelerate launch --multi_gpu --mixed_precision bf16 --num_processes $num_proces
   --patch_len 1 \
   --stride 1 \
   --batch_size $batch_size \
+  --eval_batch_size $eval_batch_size \
+  --use_amp \
   --des 'Exp' \
   --itr 1 \
   --learning_rate $learning_rate \
